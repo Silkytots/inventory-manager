@@ -46,8 +46,7 @@ const STATUS = {
   stockout: { label: "Stockout",  bg: "#fce7f3", color: "#831843", dot: "#ec4899" },
 };
 
-// ─── CALCULATIONS ─────────────────────────────────────────────────────────────
-function calcMetrics(sku, periodDays, soldKey, adjustForStockouts = true) {
+function calcMetrics(sku, periodDays, soldKey, adjustForStockouts) {
   const unitsSold = sku[soldKey] ?? 0;
   let effectiveDays = periodDays;
   if (adjustForStockouts && sku.stockoutDays && sku.stockoutDays[soldKey]) {
@@ -72,7 +71,6 @@ function calcMetrics(sku, periodDays, soldKey, adjustForStockouts = true) {
 const fmt    = n => (typeof n === "number" && isFinite(n)) ? n.toFixed(2) : "∞";
 const fmtInt = n => (typeof n === "number" && isFinite(n)) ? Math.round(n).toLocaleString() : "∞";
 
-// ─── SHOPIFY FETCHER ──────────────────────────────────────────────────────────
 async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings, onProgress) {
   const shop = domain.replace(/^https?:\/\//, "").replace(/\/$/, "");
 
@@ -83,7 +81,6 @@ async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings,
     return res.json();
   };
 
-  // Fetch products
   onProgress("Fetching products & variants…");
   const prodData = await apiFetch("/products.json?fields=id,title,product_type,variants&limit=250");
   const products = prodData.products || [];
@@ -103,7 +100,6 @@ async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings,
     });
   });
 
-  // Fetch inventory levels
   onProgress("Fetching inventory levels…");
   const invItemIds = Object.values(variantMap).map(v => v.inventoryItemId).join(",");
   const invData = await apiFetch(`/inventory_levels.json?inventory_item_ids=${invItemIds}&limit=250`);
@@ -112,32 +108,30 @@ async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings,
     if (variant) variant.stock = Math.max(0, (variant.stock || 0) + (l.available || 0));
   });
 
-  // 3-day chunks = ~96 orders per chunk, well under 250 limit
-  // 122 total requests vs 365 for daily — loads in ~60-90 seconds
-  const now = Date.now();
+  // Fetch orders in 3-day chunks — ~96 orders per chunk, well under 250 limit
+  // 122 total requests, loads in ~60-90 seconds
+  const now        = Date.now();
   const since365ms = now - 365 * 86400000;
   const since90ms  = now - 90  * 86400000;
   const since30ms  = now - 30  * 86400000;
 
   let allOrders = [];
-  const chunkDays = 3;
-  const totalChunks = Math.ceil(365 / chunkDays); // 122 chunks
+  const chunkDays   = 3;
+  const totalChunks = Math.ceil(365 / chunkDays);
 
   for (let i = 0; i < totalChunks; i++) {
     const chunkEnd   = new Date(now - i * chunkDays * 86400000).toISOString();
     const chunkStart = new Date(now - (i + 1) * chunkDays * 86400000).toISOString();
-    if (i % 10 === 0) onProgress(`Fetching orders… (${Math.round(i/totalChunks*100)}% complete, ${allOrders.length} orders so far)`);
+    if (i % 10 === 0) onProgress(`Fetching orders… (${Math.round(i / totalChunks * 100)}% complete, ${allOrders.length} orders so far)`);
     const ordData = await apiFetch(
       `/orders.json?status=any&created_at_min=${chunkStart}&created_at_max=${chunkEnd}&fields=created_at,line_items&limit=250`
     );
-    const batch = ordData.orders || [];
-    allOrders = [...allOrders, ...batch];
+    allOrders = [...allOrders, ...(ordData.orders || [])];
   }
 
   onProgress(`Processing ${allOrders.length} orders…`);
 
-  // Aggregate sales per variant per time window using ms timestamps for accuracy
-  const sales = {};
+  const sales    = {};
   const salesDays = {};
 
   allOrders.forEach(order => {
@@ -149,22 +143,10 @@ async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings,
       if (!sales[vid])     sales[vid]     = { s30: 0, s90: 0, s365: 0 };
       if (!salesDays[vid]) salesDays[vid] = { d30: new Set(), d90: new Set(), d365: new Set() };
       const qty = li.quantity || 0;
-
-      // 365 days — all orders qualify
       sales[vid].s365 += qty;
       salesDays[vid].d365.add(dayKey);
-
-      // 90 days
-      if (orderMs >= since90ms) {
-        sales[vid].s90 += qty;
-        salesDays[vid].d90.add(dayKey);
-      }
-
-      // 30 days
-      if (orderMs >= since30ms) {
-        sales[vid].s30 += qty;
-        salesDays[vid].d30.add(dayKey);
-      }
+      if (orderMs >= since90ms) { sales[vid].s90 += qty; salesDays[vid].d90.add(dayKey); }
+      if (orderMs >= since30ms) { sales[vid].s30 += qty; salesDays[vid].d30.add(dayKey); }
     });
   });
 
@@ -187,7 +169,6 @@ async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings,
   }));
 }
 
-// ─── AUTOCOMPLETE SEARCH ──────────────────────────────────────────────────────
 function AutocompleteSearch({ skus, value, onChange }) {
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState(value);
@@ -207,25 +188,25 @@ function AutocompleteSearch({ skus, value, onChange }) {
   }, [input, skus]);
 
   return (
-    <div ref={ref} style={{ position: "relative", flex: "1 1 220px" }}>
+    <div ref={ref} style={{ position:"relative", flex:"1 1 220px" }}>
       <input value={input}
         onChange={e => { setInput(e.target.value); onChange(e.target.value); setOpen(true); }}
         onFocus={() => setOpen(true)}
         placeholder="🔍 Search SKU or product name…"
-        style={{ width: "100%", padding: "8px 12px", borderRadius: 8, border: "1px solid #d1d5db", fontSize: 13 }} />
+        style={{ width:"100%", padding:"8px 12px", borderRadius:8, border:"1px solid #d1d5db", fontSize:13 }} />
       {open && suggestions.length > 0 && (
         <div className="autocomplete-list">
-          <div className="autocomplete-item" style={{ color: "#9ca3af", fontSize: 11, fontWeight: 700, background: "#f9fafb" }}>
+          <div className="autocomplete-item" style={{ color:"#9ca3af", fontSize:11, fontWeight:700, background:"#f9fafb" }}>
             {suggestions.length} match{suggestions.length !== 1 ? "es" : ""}
           </div>
           {suggestions.map(s => (
             <div key={s.id} className="autocomplete-item"
               onClick={() => { setInput(s.sku); onChange(s.sku); setOpen(false); }}>
-              <span style={{ fontWeight: 600 }}>{s.sku}</span>
-              <span style={{ color: "#9ca3af", marginLeft: 6, fontSize: 11 }}>{s.name}</span>
+              <span style={{ fontWeight:600 }}>{s.sku}</span>
+              <span style={{ color:"#9ca3af", marginLeft:6, fontSize:11 }}>{s.name}</span>
             </div>
           ))}
-          <div className="autocomplete-item" style={{ color: "#6366f1", fontWeight: 600 }}
+          <div className="autocomplete-item" style={{ color:"#6366f1", fontWeight:600 }}
             onClick={() => { setInput(""); onChange(""); setOpen(false); }}>
             ✕ Clear filter
           </div>
@@ -235,8 +216,7 @@ function AutocompleteSearch({ skus, value, onChange }) {
   );
 }
 
-// ─── UI COMPONENTS ────────────────────────────────────────────────────────────
-function ShopifyPanel({ onData, defaults, onHide }) {
+function ShopifyPanel({ onData, defaults }) {
   const [domain,   setDomain]   = useState(() => localStorage.getItem("inv_domain")   || "silky-tots-us.myshopify.com");
   const [clientId, setClientId] = useState(() => localStorage.getItem("inv_clientid") || "");
   const [secret,   setSecret]   = useState(() => localStorage.getItem("inv_secret")   || "");
@@ -246,7 +226,6 @@ function ShopifyPanel({ onData, defaults, onHide }) {
 
   const connect = async () => {
     if (!domain || !clientId || !secret) { setError("All fields required."); return; }
-    // Save credentials to localStorage so user doesn't have to re-enter
     localStorage.setItem("inv_domain",   domain);
     localStorage.setItem("inv_clientid", clientId);
     localStorage.setItem("inv_secret",   secret);
@@ -295,7 +274,10 @@ function ShopifyPanel({ onData, defaults, onHide }) {
         {progress}
       </div>}
       {error && <div style={{ marginTop:12, background:"#fee2e2", color:"#7f1d1d", borderRadius:8, padding:"10px 14px", fontSize:12 }}>⚠️ {error}</div>}
-      <p style={{ margin:"12px 0 0", fontSize:11, color:"#9ca3af" }}>🔒 Credentials used locally in your browser only.</p>
+      <p style={{ margin:"12px 0 0", fontSize:11, color:"#9ca3af" }}>
+        🔒 Credentials saved locally in your browser.{" "}
+        <button onClick={forget} style={{ background:"none", border:"none", color:"#ef4444", cursor:"pointer", fontSize:11, textDecoration:"underline" }}>Forget credentials</button>
+      </p>
     </div>
   );
 }
@@ -357,7 +339,6 @@ const SAMPLE = [
   { id:5, sku:"SOCK-WHT-M",  name:"White Crew Socks M",   productTitle:"Crew Socks",    sold30:200, sold90:570, sold365:2100, stock:300, leadTime:10, coverDays:30, daysToBuy:30 },
 ];
 
-// ─── MAIN APP ─────────────────────────────────────────────────────────────────
 function App() {
   const [skus,            setSkus]            = useState(SAMPLE);
   const [period,          setPeriod]          = useState(PERIODS[0]);
@@ -370,7 +351,25 @@ function App() {
   const [titleFilter,     setTitleFilter]     = useState("All");
   const [statusFilter,    setStatusFilter]    = useState("All");
   const [adjustStockouts, setAdjustStockouts] = useState(true);
+  const [autoLoading,     setAutoLoading]     = useState(false);
   const fileRef = useRef();
+
+  // Auto-connect on load if credentials are saved
+  useEffect(() => {
+    const d = localStorage.getItem("inv_domain");
+    const c = localStorage.getItem("inv_clientid");
+    const s = localStorage.getItem("inv_secret");
+    if (d && c && s) {
+      setAutoLoading(true);
+      setShowPanel(false);
+      fetchShopifyData(d, c, s, defaults, () => {}).then(data => {
+        setSkus(data);
+        setStoreName(d.replace(/^https?:\/\//,"").replace(".myshopify.com","").replace(/\/$/,""));
+      }).catch(() => {
+        setShowPanel(true);
+      }).finally(() => setAutoLoading(false));
+    }
+  }, []);
 
   const updateSku = useCallback((id, field, value) => {
     setSkus(prev => prev.map(s => s.id===id ? {...s,[field]:value} : s));
@@ -442,7 +441,7 @@ function App() {
           </div>
           <div style={{ display:"flex", gap:8 }}>
             <button onClick={()=>setShowPanel(s=>!s)} style={{ padding:"7px 14px", borderRadius:8, border:"1px solid #c7d2fe", background:showPanel?"#ede9fe":"#fff", cursor:"pointer", fontSize:13, fontWeight:600, color:"#4c1d95" }}>
-              🛍️ {storeName||"Connect Shopify"}
+              🛍️ {storeName ? `${storeName}` : "Connect Shopify"}
             </button>
             <input ref={fileRef} type="file" accept=".csv" style={{ display:"none" }} onChange={e=>{
               const file=e.target.files[0]; if(!file) return;
@@ -462,6 +461,13 @@ function App() {
             <button onClick={()=>fileRef.current.click()} style={{ padding:"7px 14px", borderRadius:8, border:"1px solid #d1d5db", background:"#fff", cursor:"pointer", fontSize:13, fontWeight:600, color:"#374151" }}>⬆ CSV</button>
           </div>
         </div>
+
+        {autoLoading && (
+          <div style={{ background:"#ede9fe", borderRadius:12, padding:"12px 20px", marginBottom:16, display:"flex", alignItems:"center", gap:10, fontSize:13, color:"#4c1d95" }}>
+            <span style={{ display:"inline-block", width:14, height:14, border:"2px solid #a5b4fc", borderTopColor:"#6366f1", borderRadius:"50%", animation:"spin 0.8s linear infinite" }} />
+            Auto-connecting to your Shopify store…
+          </div>
+        )}
 
         {showPanel && <ShopifyPanel onData={(data,domain)=>{
           setSkus(data);
@@ -546,8 +552,8 @@ function App() {
                 <TH label="Avail After LT" col="availAfterLT" tip="Stock remaining once your next order arrives." />
                 <TH label="Reorder Point" col="reorderPoint" tip="Order when stock hits this level. = daily sales × (lead time + 25% buffer)." />
                 <TH label="Lead Time (d)" tip="Days from placing order to stock arriving." />
-                <TH label="Cover Days" tip="Total days of stock you want to hold." />
-                <TH label="Days to Buy" tip="Days worth of stock to purchase in next order." />
+                <TH label="Cover Days" tip="Total days of stock you want to hold at all times." />
+                <TH label="Days to Buy" tip="Days worth of stock to purchase in your next order. Drives Order Qty." />
                 <TH label="Order Qty" col="orderQty" tip="Recommended units to order = (daily sales × days to buy) − available stock after lead time." />
               </tr>
             </thead>
