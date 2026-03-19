@@ -1,52 +1,588 @@
-export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inventory Manager</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', system-ui, sans-serif; background: #f1f5f9; min-height: 100vh; padding: 24px 20px; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .tooltip { position: relative; display: inline-block; }
+  .tooltip:hover .tooltiptext { visibility: visible; opacity: 1; }
+  .tooltiptext { visibility: hidden; opacity: 0; background: #1e1b4b; color: #fff; text-align: left;
+    padding: 8px 12px; border-radius: 8px; position: absolute; z-index: 999; bottom: 125%; left: 50%;
+    transform: translateX(-50%); width: 220px; font-size: 11px; line-height: 1.6;
+    transition: opacity 0.2s; pointer-events: none; }
+  .autocomplete-list { position: absolute; top: 100%; left: 0; right: 0; background: #fff;
+    border: 1px solid #d1d5db; border-radius: 8px; z-index: 100; max-height: 200px;
+    overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,.1); }
+  .autocomplete-item { padding: 8px 12px; cursor: pointer; font-size: 13px; }
+  .autocomplete-item:hover { background: #f5f3ff; color: #4c1d95; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
-  if (req.method === "OPTIONS") return res.status(200).end();
+const PROXY = "https://shopify-proxy-gilt.vercel.app/api/proxy";
 
-  const { shop, path, client_id, client_secret } = req.query;
+const PERIODS = [
+  { label: "Last 30 Days",  value: 30,  key: "sold30" },
+  { label: "Last 90 Days",  value: 90,  key: "sold90" },
+  { label: "Last 365 Days", value: 365, key: "sold365" },
+];
 
-  if (!shop || !client_id || !client_secret) {
-    return res.status(400).json({ error: "Missing shop, client_id, or client_secret" });
+const STATUS = {
+  healthy:  { label: "Healthy",   bg: "#d1fae5", color: "#065f46", dot: "#10b981" },
+  watch:    { label: "Watch",     bg: "#fef9c3", color: "#713f12", dot: "#eab308" },
+  low:      { label: "Low Stock", bg: "#ffedd5", color: "#7c2d12", dot: "#f97316" },
+  critical: { label: "Critical",  bg: "#fee2e2", color: "#7f1d1d", dot: "#ef4444" },
+  stockout: { label: "Stockout",  bg: "#fce7f3", color: "#831843", dot: "#ec4899" },
+};
+
+// ─── CORE CALCULATION ENGINE ──────────────────────────────────────────────────
+function calcMetrics(sku, periodDays, soldKey, adjustForStockouts = true) {
+  const unitsSold = sku[soldKey] ?? 0;
+
+  // Stockout-adjusted daily sales:
+  // If a product was out of stock for some days, we shouldn't count those days
+  // in the denominator — otherwise the velocity looks artificially low.
+  // We estimate "selling days" = period days minus any known stockout days.
+  let effectiveDays = periodDays;
+  if (adjustForStockouts && sku.stockoutDays) {
+    // Only subtract stockout days if it leaves at least 1 day to avoid division by zero
+    effectiveDays = Math.max(1, periodDays - (sku.stockoutDays[soldKey] || 0));
   }
 
-  try {
-    // Step 1: Get access token using client credentials grant
-    const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "client_credentials",
-        client_id,
-        client_secret,
-      }),
-    });
+  const dailySales   = unitsSold / effectiveDays;
+  const leadTimeUse  = dailySales * sku.leadTime;
+  const availAfterLT = Math.max(0, sku.stock - leadTimeUse);
+  const reorderPoint = dailySales * (sku.leadTime + Math.ceil(sku.leadTime * 0.25));
 
-    if (!tokenRes.ok) {
-      const err = await tokenRes.text();
-      return res.status(tokenRes.status).json({ error: `Token fetch failed: ${err}` });
+  // Days to Buy = how many days of stock you want to order in this purchase.
+  // Order Qty = (daily sales × days to buy) − stock already available after lead time.
+  // Floored at 0 — never recommend a negative order.
+  const rawOrderQty  = (dailySales * sku.daysToBuy) - availAfterLT;
+  const orderQty     = Math.max(0, Math.ceil(rawOrderQty));
+  const daysOfCover  = dailySales > 0 ? sku.stock / dailySales : Infinity;
+
+  let status;
+  if (sku.stock <= 0)                    status = "stockout";
+  else if (sku.stock < leadTimeUse)      status = "critical";
+  else if (sku.stock <= reorderPoint)    status = "low";
+  else if (daysOfCover >= sku.coverDays) status = "healthy";
+  else                                    status = "watch";
+
+  return { dailySales, effectiveDays, leadTimeUse, availAfterLT, reorderPoint, orderQty, daysOfCover, status };
+}
+
+const fmt    = n => (typeof n === "number" && isFinite(n)) ? n.toFixed(2) : "∞";
+const fmtInt = n => (typeof n === "number" && isFinite(n)) ? Math.round(n).toLocaleString() : "∞";
+
+// ─── SHOPIFY FETCHER ──────────────────────────────────────────────────────────
+async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings, onProgress) {
+  const shop = domain.replace(/^https?:\/\//, "").replace(/\/$/, "");
+
+  const apiFetch = async (path) => {
+    const fullPath = path + (path.includes("?") ? "&" : "?") + "limit=250";
+    const url = `${PROXY}?shop=${encodeURIComponent(shop)}&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}&path=${encodeURIComponent(fullPath)}`;
+    const res = await fetch(url);
+    if (!res.ok) { const err = await res.text(); throw new Error(`${res.status}: ${err}`); }
+    return res.json();
+  };
+
+  onProgress("Fetching products & variants…");
+  // Pull product_type along with variants for category filtering
+  const prodData = await apiFetch("/products.json?fields=id,title,product_type,variants");
+  const products = prodData.products || [];
+  if (!products.length) throw new Error("No products found.");
+
+  const variantMap = {};
+  products.forEach(p => {
+    (p.variants || []).forEach(v => {
+      variantMap[v.id] = {
+        sku: v.sku || `VAR-${v.id}`,
+        name: p.title + (v.title !== "Default Title" ? ` – ${v.title}` : ""),
+        productTitle: p.title, // used for product-level filtering
+        stock: 0, inventoryItemId: v.inventory_item_id, id: v.id,
+      };
+    });
+  });
+
+  onProgress("Fetching inventory levels…");
+  const invItemIds = Object.values(variantMap).map(v => v.inventoryItemId).join(",");
+  const invData = await apiFetch(`/inventory_levels.json?inventory_item_ids=${invItemIds}`);
+  (invData.inventory_levels || []).forEach(l => {
+    const variant = Object.values(variantMap).find(v => v.inventoryItemId === l.inventory_item_id);
+    if (variant) variant.stock = Math.max(0, (variant.stock || 0) + (l.available || 0));
+  });
+
+  onProgress("Fetching order history…");
+  const since365 = new Date(Date.now() - 365 * 86400000).toISOString();
+  const since90  = new Date(Date.now() - 90  * 86400000).toISOString();
+  const since30  = new Date(Date.now() - 30  * 86400000).toISOString();
+
+  // Fetch all orders using created_at_max sliding window pagination.
+  // We keep moving the window back in time until we've covered the full 365 days.
+  let orders = [];
+  let maxDate = new Date().toISOString();
+  let keepFetching = true;
+  let pageNum = 1;
+
+  while (keepFetching) {
+    onProgress(`Fetching order history… (${orders.length} orders so far)`);
+    const ordData = await apiFetch(
+      `/orders.json?status=any&created_at_min=${since365}&created_at_max=${maxDate}&fields=created_at,line_items&limit=250`
+    );
+    const batch = ordData.orders || [];
+    if (batch.length === 0) { keepFetching = false; break; }
+
+    orders = [...orders, ...batch];
+
+    // If fewer than 250 returned we've hit the last page
+    if (batch.length < 250) {
+      keepFetching = false;
+    } else {
+      // Move the window back — use the oldest order in this batch as new max
+      // Subtract 1ms to avoid re-fetching the last order
+      const oldest = batch[batch.length - 1].created_at;
+      const newMax = new Date(new Date(oldest).getTime() - 1).toISOString();
+      if (newMax <= since365) { keepFetching = false; break; }
+      maxDate = newMax;
     }
 
-    const { access_token } = await tokenRes.json();
-
-    // Step 2: If no path, just return the token (for testing)
-    if (!path) return res.status(200).json({ access_token });
-
-    // Step 3: Use token to call Shopify API
-    const apiRes = await fetch(
-      `https://${shop}/admin/api/2024-01${path}`,
-      { headers: { "X-Shopify-Access-Token": access_token } }
-    );
-
-    // Forward the Link header so the client can paginate
-    const linkHeader = apiRes.headers.get("link");
-    if (linkHeader) res.setHeader("link", linkHeader);
-
-    const data = await apiRes.json();
-    return res.status(apiRes.status).json(data);
-
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+    // Safety cap at 40 pages = 10,000 orders
+    if (pageNum++ > 40) keepFetching = false;
   }
+
+  onProgress(`Processing ${orders.length} orders…`);
+
+  // Track sales AND estimate stockout days per variant
+  // Stockout days = days in period where no sales occurred AND current stock = 0
+  // (Simple heuristic: count days with zero orders for that variant while stock is 0)
+  const sales = {};
+  const salesDays = {}; // track which days had sales per variant
+
+  orders.forEach(order => {
+    const createdAt = new Date(order.created_at);
+    const dayKey = createdAt.toISOString().split("T")[0];
+    (order.line_items || []).forEach(li => {
+      const vid = li.variant_id;
+      if (!vid || !variantMap[vid]) return;
+      if (!sales[vid]) sales[vid] = { s30: 0, s90: 0, s365: 0 };
+      if (!salesDays[vid]) salesDays[vid] = { d30: new Set(), d90: new Set(), d365: new Set() };
+      const qty = li.quantity || 0;
+      sales[vid].s365 += qty;
+      salesDays[vid].d365.add(dayKey);
+      if (createdAt >= new Date(since90))  { sales[vid].s90 += qty; salesDays[vid].d90.add(dayKey); }
+      if (createdAt >= new Date(since30))  { sales[vid].s30 += qty; salesDays[vid].d30.add(dayKey); }
+    });
+  });
+
+  onProgress("Building table…");
+  return Object.values(variantMap).map((v, i) => ({
+    id: v.id || i+1, sku: v.sku, name: v.name, productTitle: v.productTitle,
+    stock: v.stock,
+    sold30:  sales[v.id]?.s30  || 0,
+    sold90:  sales[v.id]?.s90  || 0,
+    sold365: sales[v.id]?.s365 || 0,
+    // Estimated stockout days: if current stock is 0 and selling days << period days,
+    // the gap days are likely stockout days
+    stockoutDays: v.stock === 0 ? {
+      sold30:  Math.max(0, 30  - (salesDays[v.id]?.d30.size  || 0)),
+      sold90:  Math.max(0, 90  - (salesDays[v.id]?.d90.size  || 0)),
+      sold365: Math.max(0, 365 - (salesDays[v.id]?.d365.size || 0)),
+    } : null,
+    ...defaultSettings,
+  }));
 }
+
+// ─── AUTOCOMPLETE SEARCH ──────────────────────────────────────────────────────
+function AutocompleteSearch({ skus, value, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState(value);
+  const ref = useRef();
+
+  useEffect(() => { setInput(value); }, [value]);
+
+  useEffect(() => {
+    const handler = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  const suggestions = useMemo(() => {
+    if (!input) return [];
+    const q = input.toLowerCase();
+    return skus
+      .filter(s => s.sku.toLowerCase().includes(q) || s.name.toLowerCase().includes(q))
+      .slice(0, 8);
+  }, [input, skus]);
+
+  return (
+    <div ref={ref} style={{ position: "relative", flex: "1 1 220px" }}>
+      <input
+        value={input}
+        onChange={e => { setInput(e.target.value); onChange(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        placeholder="🔍 Search SKU or product name…"
+        style={{ width: "100%", padding: "8px 12px", borderRadius: 8, border: "1px solid #d1d5db", fontSize: 13 }}
+      />
+      {open && suggestions.length > 0 && (
+        <div className="autocomplete-list">
+          <div className="autocomplete-item" style={{ color: "#9ca3af", fontSize: 11, fontWeight: 700, background: "#f9fafb" }}>
+            {suggestions.length} match{suggestions.length !== 1 ? "es" : ""}
+          </div>
+          {suggestions.map(s => (
+            <div key={s.id} className="autocomplete-item" onClick={() => { setInput(s.sku); onChange(s.sku); setOpen(false); }}>
+              <span style={{ fontWeight: 600 }}>{s.sku}</span>
+              <span style={{ color: "#9ca3af", marginLeft: 6, fontSize: 11 }}>{s.name}</span>
+            </div>
+          ))}
+          {input && (
+            <div className="autocomplete-item" style={{ color: "#6366f1", fontWeight: 600 }}
+              onClick={() => { setInput(""); onChange(""); setOpen(false); }}>
+              ✕ Clear filter
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── SHARED UI ────────────────────────────────────────────────────────────────
+function ShopifyPanel({ onData, defaults }) {
+  const [domain,   setDomain]   = useState("silky-tots-us.myshopify.com");
+  const [clientId, setClientId] = useState("");
+  const [secret,   setSecret]   = useState("");
+  const [loading,  setLoading]  = useState(false);
+  const [progress, setProgress] = useState("");
+  const [error,    setError]    = useState("");
+
+  const connect = async () => {
+    if (!domain || !clientId || !secret) { setError("All fields required."); return; }
+    setLoading(true); setError(""); setProgress("");
+    try {
+      const skus = await fetchShopifyData(domain, clientId, secret, defaults, setProgress);
+      onData(skus, domain);
+    } catch(e) { setError(`Connection failed: ${e.message}`); }
+    finally { setLoading(false); setProgress(""); }
+  };
+
+  const inp = { padding: "8px 12px", borderRadius: 8, border: "1px solid #d1d5db", fontSize: 13, width: "100%" };
+  return (
+    <div style={{ background:"#fff", border:"2px solid #c7d2fe", borderRadius:14, padding:24, marginBottom:20 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+        <span style={{ fontSize:22 }}>🛍️</span>
+        <div>
+          <strong style={{ fontSize:15, color:"#1e1b4b" }}>Connect Shopify Store</strong>
+          <p style={{ margin:0, fontSize:12, color:"#6b7280" }}>Client ID and Client Secret from Dev Dashboard → your app → Settings.</p>
+        </div>
+      </div>
+      <div style={{ display:"flex", flexWrap:"wrap", gap:12, alignItems:"flex-end" }}>
+        {[["Store Domain","text",domain,setDomain,"your-store.myshopify.com"],
+          ["Client ID","text",clientId,setClientId,"From Dev Dashboard → Settings"],
+          ["Client Secret","password",secret,setSecret,"From Dev Dashboard → Settings"]
+        ].map(([lbl,type,val,set,ph]) => (
+          <label key={lbl} style={{ display:"flex", flexDirection:"column", gap:4, fontSize:12, fontWeight:700, color:"#374151", flex:"1 1 200px" }}>
+            {lbl}
+            <input type={type} placeholder={ph} value={val} onChange={e=>set(e.target.value)} style={inp} />
+          </label>
+        ))}
+        <button onClick={connect} disabled={loading} style={{
+          padding:"9px 22px", borderRadius:8, border:"none", cursor:loading?"not-allowed":"pointer",
+          background:loading?"#a5b4fc":"#6366f1", color:"#fff", fontWeight:700, fontSize:14, alignSelf:"flex-end"
+        }}>{loading?"Connecting…":"🔌 Connect"}</button>
+      </div>
+      {progress && <div style={{ marginTop:12, display:"flex", alignItems:"center", gap:8, fontSize:13, color:"#6366f1" }}>
+        <span style={{ display:"inline-block", width:14, height:14, border:"2px solid #a5b4fc", borderTopColor:"#6366f1", borderRadius:"50%", animation:"spin 0.8s linear infinite" }} />{progress}
+      </div>}
+      {error && <div style={{ marginTop:12, background:"#fee2e2", color:"#7f1d1d", borderRadius:8, padding:"10px 14px", fontSize:12 }}>⚠️ {error}</div>}
+      <p style={{ margin:"12px 0 0", fontSize:11, color:"#9ca3af" }}>🔒 Credentials used locally in your browser only.</p>
+    </div>
+  );
+}
+
+function StatusBadge({ status }) {
+  const s = STATUS[status] || STATUS.watch;
+  return <span style={{ display:"inline-flex", alignItems:"center", gap:5, padding:"2px 10px", borderRadius:99, fontSize:11, fontWeight:700, background:s.bg, color:s.color, whiteSpace:"nowrap" }}>
+    <span style={{ width:7, height:7, borderRadius:"50%", background:s.dot, display:"inline-block" }} />{s.label}
+  </span>;
+}
+
+function EditCell({ value, onChange, width=68 }) {
+  return <input type="number" min={0} value={value} onChange={e=>onChange(Number(e.target.value))}
+    style={{ width, padding:"3px 6px", border:"1px solid #d1d5db", borderRadius:6, fontSize:13, textAlign:"right", background:"#f9fafb" }}
+    onFocus={e=>{e.target.style.borderColor="#6366f1";e.target.style.background="#fff"}}
+    onBlur={e=>{e.target.style.borderColor="#d1d5db";e.target.style.background="#f9fafb"}} />;
+}
+
+function Tip({ text }) {
+  return <span className="tooltip" style={{ cursor:"help", color:"#9ca3af", fontSize:11, marginLeft:3 }}>
+    ⓘ<span className="tooltiptext">{text}</span>
+  </span>;
+}
+
+function SKURow({ sku, periodDays, periodKey, onUpdate, adjustStockouts }) {
+  const m = calcMetrics(sku, periodDays, periodKey, adjustStockouts);
+  const rowBg = (m.status==="critical"||m.status==="stockout") ? "#fffbfb" : "#fff";
+  const cell = (content, align="right") => <td style={{ padding:"9px 10px", textAlign:align, fontSize:13, color:"#374151", whiteSpace:"nowrap" }}>{content}</td>;
+  return <tr style={{ background:rowBg, borderBottom:"1px solid #f3f4f6" }}
+    onMouseEnter={e=>e.currentTarget.style.background="#f5f3ff"}
+    onMouseLeave={e=>e.currentTarget.style.background=rowBg}>
+    {cell(<div>
+      <div style={{ fontWeight:600, fontSize:13, color:"#1f2937" }}>{sku.sku}</div>
+      <div style={{ fontSize:11, color:"#9ca3af" }}>{sku.name}</div>
+      {sku.productType && <div style={{ fontSize:10, color:"#c4b5fd", fontWeight:600, marginTop:1 }}>{sku.productType}</div>}
+    </div>,"left")}
+    {cell(<StatusBadge status={m.status} />,"center")}
+    {cell(<span title={adjustStockouts && sku.stockoutDays ? `Adjusted for ~${sku.stockoutDays[periodKey]||0} stockout days` : "Raw average"}>
+      {fmt(m.dailySales)}{adjustStockouts && sku.stockoutDays && sku.stockoutDays[periodKey] > 0 ? " *" : ""}
+    </span>)}
+    {cell(<EditCell value={sku.stock} onChange={v=>onUpdate("stock",v)} width={72} />)}
+    {cell(isFinite(m.daysOfCover) ? fmtInt(m.daysOfCover)+"d" : "∞")}
+    {cell(fmt(m.leadTimeUse))}
+    {cell(fmt(m.availAfterLT))}
+    {cell(fmt(m.reorderPoint))}
+    {cell(<EditCell value={sku.leadTime}  onChange={v=>onUpdate("leadTime",v)}  width={56} />)}
+    {cell(<EditCell value={sku.coverDays} onChange={v=>onUpdate("coverDays",v)} width={56} />)}
+    {cell(<EditCell value={sku.daysToBuy} onChange={v=>onUpdate("daysToBuy",v)} width={56} />)}
+    {cell(<span style={{ display:"inline-block", padding:"3px 10px", borderRadius:8, fontWeight:700, fontSize:13,
+      background:m.orderQty>0?"#ede9fe":"#f0fdf4", color:m.orderQty>0?"#5b21b6":"#166534" }}>{fmtInt(m.orderQty)}</span>)}
+  </tr>;
+}
+
+const SAMPLE = [
+  { id:1, sku:"SHOE-BLK-10", name:"Black Sneaker Size 10", productType:"Footwear", sold30:90,  sold90:240, sold365:900,  stock:45,  leadTime:14, coverDays:60, daysToBuy:45 },
+  { id:2, sku:"SHOE-WHT-9",  name:"White Runner Size 9",  productType:"Footwear", sold30:60,  sold90:195, sold365:720,  stock:8,   leadTime:14, coverDays:60, daysToBuy:45 },
+  { id:3, sku:"BAG-TOTE-L",  name:"Canvas Tote Large",    productType:"Bags",     sold30:30,  sold90:105, sold365:390,  stock:72,  leadTime:21, coverDays:90, daysToBuy:60 },
+  { id:4, sku:"HAT-CAP-BLU", name:"Blue Baseball Cap",    productType:"Hats",     sold30:120, sold90:330, sold365:1200, stock:15,  leadTime:7,  coverDays:45, daysToBuy:30 },
+  { id:5, sku:"SOCK-WHT-M",  name:"White Crew Socks M",   productType:"Socks",    sold30:200, sold90:570, sold365:2100, stock:300, leadTime:10, coverDays:30, daysToBuy:30 },
+];
+
+function App() {
+  const [skus,           setSkus]           = useState(SAMPLE);
+  const [period,         setPeriod]         = useState(PERIODS[0]);
+  const [defaults,       setDefaults]       = useState({ leadTime:14, coverDays:60, daysToBuy:45 });
+  const [storeName,      setStoreName]      = useState(null);
+  const [showPanel,      setShowPanel]      = useState(true);
+  const [sortCol,        setSortCol]        = useState(null);
+  const [sortDir,        setSortDir]        = useState(1);
+  const [skuFilter,      setSkuFilter]      = useState("");
+  const [typeFilter,     setTypeFilter]     = useState("All");
+  const [statusFilter,   setStatusFilter]   = useState("All");
+  const [adjustStockouts,setAdjustStockouts]= useState(true);
+  const fileRef = useRef();
+
+  const updateSku = useCallback((id, field, value) => {
+    setSkus(prev => prev.map(s => s.id===id ? {...s,[field]:value} : s));
+  }, []);
+
+  const handleSort = col => {
+    setSortCol(c => { if(c===col){setSortDir(d=>-d);return col;} setSortDir(1);return col; });
+  };
+
+  // Unique product titles for filter dropdown
+  const productTitles = useMemo(() => {
+    const titles = [...new Set(skus.map(s => s.productTitle).filter(Boolean))].sort();
+    return ["All", ...titles];
+  }, [skus]);
+
+  const filteredSkus = useMemo(() => {
+    return skus.filter(s => {
+      const q = skuFilter.toLowerCase();
+      const matchSku  = !q || s.sku.toLowerCase().includes(q) || s.name.toLowerCase().includes(q);
+      const matchType = typeFilter === "All" || s.productTitle === typeFilter;
+      const matchStatus = statusFilter === "All" || calcMetrics(s, period.value, period.key, adjustStockouts).status === statusFilter;
+      return matchSku && matchType && matchStatus;
+    });
+  }, [skus, skuFilter, typeFilter, statusFilter, period, adjustStockouts]);
+
+  const displaySkus = useMemo(() => {
+    if (!sortCol) return filteredSkus;
+    return [...filteredSkus].sort((a,b) => {
+      const ma = calcMetrics(a,period.value,period.key,adjustStockouts);
+      const mb = calcMetrics(b,period.value,period.key,adjustStockouts);
+      const va = ma[sortCol]??a[sortCol]??0;
+      const vb = mb[sortCol]??b[sortCol]??0;
+      return (va<vb?-1:va>vb?1:0)*sortDir;
+    });
+  }, [filteredSkus,sortCol,sortDir,period,adjustStockouts]);
+
+  const counts = { healthy:0, watch:0, low:0, critical:0, stockout:0 };
+  skus.forEach(s => { counts[calcMetrics(s,period.value,period.key,adjustStockouts).status]++; });
+  const totalOrder = filteredSkus.reduce((acc,s) => acc+calcMetrics(s,period.value,period.key,adjustStockouts).orderQty, 0);
+
+  const TH = ({label,col,tip}) => <th onClick={()=>col&&handleSort(col)} style={{
+    padding:"10px", textAlign:"right", fontSize:11, fontWeight:700, color:"#6b7280",
+    textTransform:"uppercase", letterSpacing:"0.05em", cursor:col?"pointer":"default",
+    whiteSpace:"nowrap", userSelect:"none", background:sortCol===col?"#eef2ff":"#f9fafb"
+  }}>{label}{tip&&<Tip text={tip}/>}{col&&sortCol===col?(sortDir===1?" ↑":" ↓"):""}</th>;
+
+  return (
+    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f1f5f9", minHeight:"100vh", padding:"24px 20px" }}>
+      <div style={{ maxWidth:1400, margin:"0 auto" }}>
+
+        {/* Header */}
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12, marginBottom:24 }}>
+          <div>
+            <h1 style={{ fontSize:22, fontWeight:800, color:"#1e1b4b" }}>📦 Inventory Manager</h1>
+            <p style={{ fontSize:13, color:"#6b7280", marginTop:2 }}>Real-time reorder planning · powered by Shopify</p>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:8, background:"#fff", border:"1px solid #e5e7eb", borderRadius:10, padding:"6px 8px" }}>
+            <span style={{ fontSize:12, fontWeight:700, color:"#6b7280", paddingLeft:4 }}>VELOCITY PERIOD:</span>
+            {PERIODS.map(p => <button key={p.value} onClick={()=>setPeriod(p)} style={{
+              padding:"6px 14px", borderRadius:8, border:"none", cursor:"pointer", fontSize:13, fontWeight:600,
+              background:period.value===p.value?"#6366f1":"transparent",
+              color:period.value===p.value?"#fff":"#6b7280"
+            }}>{p.label}</button>)}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={()=>setShowPanel(s=>!s)} style={{ padding:"7px 14px", borderRadius:8, border:"1px solid #c7d2fe", background:showPanel?"#ede9fe":"#fff", cursor:"pointer", fontSize:13, fontWeight:600, color:"#4c1d95" }}>
+              🛍️ {storeName||"Connect Shopify"}
+            </button>
+            <input ref={fileRef} type="file" accept=".csv" style={{ display:"none" }} onChange={e=>{
+              const file=e.target.files[0]; if(!file) return;
+              const r=new FileReader();
+              r.onload=ev=>{
+                const lines=ev.target.result.trim().split("\n");
+                const hdrs=lines[0].split(",").map(h=>h.trim().toLowerCase().replace(/\s+/g,"_"));
+                setSkus(lines.slice(1).map((l,i)=>{
+                  const v=l.split(",").map(x=>x.trim()); const o={};
+                  hdrs.forEach((h,j)=>o[h]=v[j]);
+                  return{id:Date.now()+i,sku:o.sku||`SKU-${i+1}`,name:o.name||"",productType:o.product_type||"",sold30:+o.sold30||0,sold90:+o.sold90||0,sold365:+o.sold365||0,stock:+o.stock||0,...defaults};
+                }));
+              };
+              r.readAsText(file);
+            }} />
+            <button onClick={()=>fileRef.current.click()} style={{ padding:"7px 14px", borderRadius:8, border:"1px solid #d1d5db", background:"#fff", cursor:"pointer", fontSize:13, fontWeight:600, color:"#374151" }}>⬆ CSV</button>
+          </div>
+        </div>
+
+        {showPanel && <ShopifyPanel onData={(data,domain)=>{ setSkus(data); setStoreName(domain.replace(/^https?:\/\//,"").replace(".myshopify.com","").replace(/\/$/,"")); setShowPanel(false); }} defaults={defaults} />}
+
+        {/* Global Defaults */}
+        <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"14px 20px", marginBottom:16 }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
+            <strong style={{ fontSize:14, color:"#374151" }}>🌐 Global Defaults</strong>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:14, alignItems:"center" }}>
+              {[["Lead Time (days)","leadTime","Days from placing an order to stock arriving in your warehouse."],
+                ["Cover Days","coverDays","The total days of stock you want to HOLD at all times. Used to judge if stock is Healthy or Watch. E.g. 60 = you want 60 days of stock on hand."],
+                ["Days to Buy","daysToBuy","How many days worth of stock to purchase in your NEXT order. E.g. 45 = buy enough stock to last 45 days. Drives the Order Qty recommendation."]
+              ].map(([lbl,key,tip])=>(
+                <label key={key} style={{ display:"flex", alignItems:"center", gap:4, fontSize:13, color:"#6b7280" }}>
+                  {lbl}<Tip text={tip}/> <EditCell value={defaults[key]} onChange={v=>setDefaults(d=>({...d,[key]:v}))} width={60} />
+                </label>
+              ))}
+              <button onClick={()=>setSkus(prev=>prev.map(s=>({...s,...defaults})))} style={{ padding:"6px 14px", borderRadius:8, border:"none", cursor:"pointer", background:"#6366f1", color:"#fff", fontWeight:700, fontSize:13 }}>Apply to All</button>
+            </div>
+          </div>
+        </div>
+
+        {/* Filters */}
+        <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"12px 16px", marginBottom:16, display:"flex", flexWrap:"wrap", gap:12, alignItems:"center" }}>
+          <strong style={{ fontSize:13, color:"#374151", whiteSpace:"nowrap" }}>🔎 Filters</strong>
+
+          <AutocompleteSearch skus={skus} value={skuFilter} onChange={setSkuFilter} />
+
+          <select value={typeFilter} onChange={e=>setTypeFilter(e.target.value)}
+            style={{ padding:"8px 12px", borderRadius:8, border:"1px solid #d1d5db", fontSize:13, color:"#374151", background:"#fff", flex:"0 0 auto" }}>
+            {productTitles.map(t => <option key={t} value={t}>{t === "All" ? "All Products" : t}</option>)}
+          </select>
+
+          <select value={statusFilter} onChange={e=>setStatusFilter(e.target.value)}
+            style={{ padding:"8px 12px", borderRadius:8, border:"1px solid #d1d5db", fontSize:13, color:"#374151", background:"#fff", flex:"0 0 auto" }}>
+            <option value="All">All Statuses</option>
+            {Object.entries(STATUS).map(([k,s]) => <option key={k} value={k}>{s.label}</option>)}
+          </select>
+
+          <label style={{ display:"flex", alignItems:"center", gap:6, fontSize:13, color:"#6b7280", cursor:"pointer", whiteSpace:"nowrap" }}>
+            <input type="checkbox" checked={adjustStockouts} onChange={e=>setAdjustStockouts(e.target.checked)} />
+            Adjust for stockouts <Tip text={"When enabled, daily sales velocity is calculated using only days the product was in stock — giving a more accurate reorder recommendation. Adjusted SKUs are marked with *."}/>
+          </label>
+
+          {(skuFilter || typeFilter !== "All" || statusFilter !== "All") && (
+            <button onClick={()=>{ setSkuFilter(""); setTypeFilter("All"); setStatusFilter("All"); }}
+              style={{ padding:"6px 12px", borderRadius:8, border:"1px solid #e5e7eb", background:"#f9fafb", cursor:"pointer", fontSize:12, color:"#6b7280" }}>
+              ✕ Clear filters
+            </button>
+          )}
+
+          <span style={{ marginLeft:"auto", fontSize:12, color:"#9ca3af" }}>
+            Showing {filteredSkus.length} of {skus.length} SKUs
+          </span>
+        </div>
+
+        {/* Summary */}
+        <div style={{ display:"flex", flexWrap:"wrap", gap:10, marginBottom:20, alignItems:"center" }}>
+          {storeName && <div style={{ background:"#ede9fe", color:"#4c1d95", borderRadius:10, padding:"8px 14px", fontSize:13, fontWeight:700 }}>🛍️ {storeName}</div>}
+          {Object.entries(counts).map(([k,v])=>(
+            <div key={k} onClick={()=>setStatusFilter(statusFilter===k?"All":k)}
+              style={{ background:STATUS[k].bg, color:STATUS[k].color, border:`1px solid ${STATUS[k].dot}33`, borderRadius:10, padding:"8px 16px", fontSize:13, fontWeight:600, cursor:"pointer", outline: statusFilter===k?`2px solid ${STATUS[k].dot}`:"none" }}>
+              {STATUS[k].label}: <strong>{v}</strong>
+            </div>
+          ))}
+          <div style={{ background:"#ede9fe", color:"#4c1d95", border:"1px solid #c4b5fd", borderRadius:10, padding:"8px 16px", fontSize:13, fontWeight:600, marginLeft:"auto" }}>
+            Order Total: <strong>{fmtInt(totalOrder)} units</strong>
+          </div>
+        </div>
+
+        {/* Table */}
+        <div style={{ background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"auto", boxShadow:"0 1px 4px rgba(0,0,0,.06)" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", minWidth:1100 }}>
+            <thead>
+              <tr style={{ borderBottom:"2px solid #e5e7eb" }}>
+                <TH label="SKU / Product" />
+                <TH label="Status" col="status" />
+                <TH label="Daily Sales" col="dailySales" tip="Average units sold per day. * = adjusted for stockout periods." />
+                <TH label="Stock on Hand" col="stock" />
+                <TH label="Days Cover" col="daysOfCover" tip="How many days your current stock will last at current sales velocity." />
+                <TH label="Lead Time Use" col="leadTimeUse" tip="Units you'll sell while waiting for your next order to arrive." />
+                <TH label="Avail After LT" col="availAfterLT" tip="Stock remaining once your next order arrives." />
+                <TH label="Reorder Point" col="reorderPoint" tip="Daily sales × (lead time + 25% safety buffer). Order when stock hits this level." />
+                <TH label="Lead Time (d)" tip="Days from placing order to stock arriving." />
+                <TH label="Cover Days" tip="Total days of stock you want to hold." />
+                <TH label="Days to Buy" tip="How many days worth of stock to purchase in your next order." />
+                <TH label="Order Qty" col="orderQty" tip="Recommended units to order = (daily sales × days to buy) − available stock after lead time." />
+              </tr>
+            </thead>
+            <tbody>
+              {displaySkus.length === 0
+                ? <tr><td colSpan={12} style={{ textAlign:"center", padding:"40px", color:"#9ca3af", fontSize:14 }}>No SKUs match your filters</td></tr>
+                : displaySkus.map(s=>(
+                  <SKURow key={s.id} sku={s} periodDays={period.value} periodKey={period.key}
+                    onUpdate={(field,val)=>updateSku(s.id,field,val)} adjustStockouts={adjustStockouts} />
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ marginTop:12, fontSize:11, color:"#9ca3af" }}>
+          * Daily sales marked with * have been adjusted for estimated stockout periods. Click any status badge above to filter by that status.
+        </div>
+
+        <div style={{ marginTop:10, display:"flex", flexWrap:"wrap", gap:10, alignItems:"center" }}>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:600 }}>LEGEND:</span>
+          {Object.entries(STATUS).map(([k,s])=>(
+            <span key={k} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, color:s.color, background:s.bg, borderRadius:6, padding:"2px 8px" }}>
+              <span style={{ width:6, height:6, borderRadius:"50%", background:s.dot, display:"inline-block" }} />{s.label}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
