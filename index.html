@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inventory Manager</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', system-ui, sans-serif; background: #f1f5f9; min-height: 100vh; padding: 24px 20px; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useMemo, useRef } = React;
+
+const PROXY = "https://shopify-proxy-gilt.vercel.app/api/proxy";
+
+const PERIODS = [
+  { label: "Last 30 Days",  value: 30,  key: "sold30" },
+  { label: "Last 90 Days",  value: 90,  key: "sold90" },
+  { label: "Last 365 Days", value: 365, key: "sold365" },
+];
+
+const STATUS = {
+  healthy:  { label: "Healthy",   bg: "#d1fae5", color: "#065f46", dot: "#10b981" },
+  watch:    { label: "Watch",     bg: "#fef9c3", color: "#713f12", dot: "#eab308" },
+  low:      { label: "Low Stock", bg: "#ffedd5", color: "#7c2d12", dot: "#f97316" },
+  critical: { label: "Critical",  bg: "#fee2e2", color: "#7f1d1d", dot: "#ef4444" },
+  stockout: { label: "Stockout",  bg: "#fce7f3", color: "#831843", dot: "#ec4899" },
+};
+
+function calcMetrics(sku, periodDays, soldKey) {
+  const unitsSold    = sku[soldKey] ?? 0;
+  const dailySales   = unitsSold / periodDays;
+  const leadTimeUse  = dailySales * sku.leadTime;
+  const availAfterLT = Math.max(0, sku.stock - leadTimeUse);
+  const reorderPoint = dailySales * (sku.leadTime + Math.ceil(sku.leadTime * 0.25));
+  const rawOrderQty  = (dailySales * sku.daysToBuy) - availAfterLT;
+  const orderQty     = Math.max(0, Math.ceil(rawOrderQty));
+  const daysOfCover  = dailySales > 0 ? sku.stock / dailySales : Infinity;
+  let status;
+  if (sku.stock <= 0)                    status = "stockout";
+  else if (sku.stock < leadTimeUse)      status = "critical";
+  else if (sku.stock <= reorderPoint)    status = "low";
+  else if (daysOfCover >= sku.coverDays) status = "healthy";
+  else                                    status = "watch";
+  return { dailySales, leadTimeUse, availAfterLT, reorderPoint, orderQty, daysOfCover, status };
+}
+
+const fmt    = n => (typeof n === "number" && isFinite(n)) ? n.toFixed(2) : "∞";
+const fmtInt = n => (typeof n === "number" && isFinite(n)) ? Math.round(n).toLocaleString() : "∞";
+
+async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings, onProgress) {
+  const shop = domain.replace(/^https?:\/\//, "").replace(/\/$/, "");
+
+  const apiFetch = async (path) => {
+    const fullPath = path + (path.includes("?") ? "&" : "?") + "limit=250";
+    const url = `${PROXY}?shop=${encodeURIComponent(shop)}&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}&path=${encodeURIComponent(fullPath)}`;
+    const res = await fetch(url);
+    if (!res.ok) { const err = await res.text(); throw new Error(`${res.status}: ${err}`); }
+    return res.json();
+  };
+
+  onProgress("Fetching products & variants…");
+  const prodData = await apiFetch("/products.json?fields=id,title,variants");
+  const products = prodData.products || [];
+  if (!products.length) throw new Error("No products found. Check credentials and app installation.");
+
+  const variantMap = {};
+  products.forEach(p => {
+    (p.variants || []).forEach(v => {
+      variantMap[v.id] = {
+        sku: v.sku || `VAR-${v.id}`,
+        name: p.title + (v.title !== "Default Title" ? ` – ${v.title}` : ""),
+        stock: 0, inventoryItemId: v.inventory_item_id, id: v.id,
+      };
+    });
+  });
+
+  onProgress("Fetching inventory levels…");
+  const invItemIds = Object.values(variantMap).map(v => v.inventoryItemId).join(",");
+  const invData = await apiFetch(`/inventory_levels.json?inventory_item_ids=${invItemIds}`);
+  (invData.inventory_levels || []).forEach(l => {
+    const variant = Object.values(variantMap).find(v => v.inventoryItemId === l.inventory_item_id);
+    if (variant) variant.stock = Math.max(0, (variant.stock || 0) + (l.available || 0));
+  });
+
+  onProgress("Fetching order history…");
+  const since365 = new Date(Date.now() - 365 * 86400000).toISOString();
+  const since90  = new Date(Date.now() - 90  * 86400000).toISOString();
+  const since30  = new Date(Date.now() - 30  * 86400000).toISOString();
+  const ordData  = await apiFetch(`/orders.json?status=any&created_at_min=${since365}&fields=created_at,line_items`);
+  const orders   = ordData.orders || [];
+
+  const sales = {};
+  orders.forEach(order => {
+    const createdAt = new Date(order.created_at);
+    (order.line_items || []).forEach(li => {
+      const vid = li.variant_id;
+      if (!vid || !variantMap[vid]) return;
+      if (!sales[vid]) sales[vid] = { s30: 0, s90: 0, s365: 0 };
+      sales[vid].s365 += li.quantity || 0;
+      if (createdAt >= new Date(since90)) sales[vid].s90 += li.quantity || 0;
+      if (createdAt >= new Date(since30)) sales[vid].s30 += li.quantity || 0;
+    });
+  });
+
+  onProgress("Building table…");
+  return Object.values(variantMap).map((v, i) => ({
+    id: v.id || i+1, sku: v.sku, name: v.name, stock: v.stock,
+    sold30: sales[v.id]?.s30||0, sold90: sales[v.id]?.s90||0, sold365: sales[v.id]?.s365||0,
+    ...defaultSettings,
+  }));
+}
+
+function ShopifyPanel({ onData, defaults }) {
+  const [domain,   setDomain]   = useState("silky-tots-us.myshopify.com");
+  const [clientId, setClientId] = useState("");
+  const [secret,   setSecret]   = useState("");
+  const [loading,  setLoading]  = useState(false);
+  const [progress, setProgress] = useState("");
+  const [error,    setError]    = useState("");
+
+  const connect = async () => {
+    if (!domain || !clientId || !secret) { setError("All fields required."); return; }
+    setLoading(true); setError(""); setProgress("");
+    try {
+      const skus = await fetchShopifyData(domain, clientId, secret, defaults, setProgress);
+      onData(skus, domain);
+    } catch(e) { setError(`Connection failed: ${e.message}`); }
+    finally { setLoading(false); setProgress(""); }
+  };
+
+  const inp = { padding: "8px 12px", borderRadius: 8, border: "1px solid #d1d5db", fontSize: 13, width: "100%" };
+
+  return (
+    <div style={{ background:"#fff", border:"2px solid #c7d2fe", borderRadius:14, padding:24, marginBottom:20 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:16 }}>
+        <span style={{ fontSize:22 }}>🛍️</span>
+        <div>
+          <strong style={{ fontSize:15, color:"#1e1b4b" }}>Connect Shopify Store</strong>
+          <p style={{ margin:0, fontSize:12, color:"#6b7280" }}>Enter your Client ID and Client Secret from Dev Dashboard → your app → Settings.</p>
+        </div>
+      </div>
+      <div style={{ display:"flex", flexWrap:"wrap", gap:12, alignItems:"flex-end" }}>
+        {[["Store Domain","text",domain,setDomain,"your-store.myshopify.com"],
+          ["Client ID","text",clientId,setClientId,"From Dev Dashboard → Settings"],
+          ["Client Secret","password",secret,setSecret,"From Dev Dashboard → Settings"]
+        ].map(([lbl,type,val,set,ph]) => (
+          <label key={lbl} style={{ display:"flex", flexDirection:"column", gap:4, fontSize:12, fontWeight:700, color:"#374151", flex:"1 1 200px" }}>
+            {lbl}
+            <input type={type} placeholder={ph} value={val} onChange={e=>set(e.target.value)} style={inp} />
+          </label>
+        ))}
+        <button onClick={connect} disabled={loading} style={{
+          padding:"9px 22px", borderRadius:8, border:"none", cursor: loading?"not-allowed":"pointer",
+          background: loading?"#a5b4fc":"#6366f1", color:"#fff", fontWeight:700, fontSize:14, alignSelf:"flex-end"
+        }}>
+          {loading ? "Connecting…" : "🔌 Connect"}
+        </button>
+      </div>
+      {progress && <div style={{ marginTop:12, display:"flex", alignItems:"center", gap:8, fontSize:13, color:"#6366f1" }}>
+        <span style={{ display:"inline-block", width:14, height:14, border:"2px solid #a5b4fc", borderTopColor:"#6366f1", borderRadius:"50%", animation:"spin 0.8s linear infinite" }} />
+        {progress}
+      </div>}
+      {error && <div style={{ marginTop:12, background:"#fee2e2", color:"#7f1d1d", borderRadius:8, padding:"10px 14px", fontSize:12 }}>⚠️ {error}</div>}
+      <p style={{ margin:"12px 0 0", fontSize:11, color:"#9ca3af" }}>🔒 Credentials are only used locally in your browser.</p>
+    </div>
+  );
+}
+
+function StatusBadge({ status }) {
+  const s = STATUS[status] || STATUS.watch;
+  return <span style={{ display:"inline-flex", alignItems:"center", gap:5, padding:"2px 10px", borderRadius:99, fontSize:11, fontWeight:700, background:s.bg, color:s.color, whiteSpace:"nowrap" }}>
+    <span style={{ width:7, height:7, borderRadius:"50%", background:s.dot, display:"inline-block" }} />{s.label}
+  </span>;
+}
+
+function EditCell({ value, onChange, width=68 }) {
+  return <input type="number" min={0} value={value} onChange={e=>onChange(Number(e.target.value))}
+    style={{ width, padding:"3px 6px", border:"1px solid #d1d5db", borderRadius:6, fontSize:13, textAlign:"right", background:"#f9fafb" }}
+    onFocus={e=>{e.target.style.borderColor="#6366f1";e.target.style.background="#fff"}}
+    onBlur={e=>{e.target.style.borderColor="#d1d5db";e.target.style.background="#f9fafb"}} />;
+}
+
+function SKURow({ sku, periodDays, periodKey, onUpdate }) {
+  const m = calcMetrics(sku, periodDays, periodKey);
+  const rowBg = (m.status==="critical"||m.status==="stockout") ? "#fffbfb" : "#fff";
+  const cell = (content, align="right") => <td style={{ padding:"9px 10px", textAlign:align, fontSize:13, color:"#374151", whiteSpace:"nowrap" }}>{content}</td>;
+  return <tr style={{ background:rowBg, borderBottom:"1px solid #f3f4f6" }}
+    onMouseEnter={e=>e.currentTarget.style.background="#f5f3ff"}
+    onMouseLeave={e=>e.currentTarget.style.background=rowBg}>
+    {cell(<div><div style={{ fontWeight:600, fontSize:13, color:"#1f2937" }}>{sku.sku}</div><div style={{ fontSize:11, color:"#9ca3af" }}>{sku.name}</div></div>,"left")}
+    {cell(<StatusBadge status={m.status} />,"center")}
+    {cell(fmt(m.dailySales))}
+    {cell(<EditCell value={sku.stock} onChange={v=>onUpdate("stock",v)} width={72} />)}
+    {cell(isFinite(m.daysOfCover) ? fmtInt(m.daysOfCover)+"d" : "∞")}
+    {cell(fmt(m.leadTimeUse))}
+    {cell(fmt(m.availAfterLT))}
+    {cell(fmt(m.reorderPoint))}
+    {cell(<EditCell value={sku.leadTime}  onChange={v=>onUpdate("leadTime",v)}  width={56} />)}
+    {cell(<EditCell value={sku.coverDays} onChange={v=>onUpdate("coverDays",v)} width={56} />)}
+    {cell(<EditCell value={sku.daysToBuy} onChange={v=>onUpdate("daysToBuy",v)} width={56} />)}
+    {cell(<span style={{ display:"inline-block", padding:"3px 10px", borderRadius:8, fontWeight:700, fontSize:13, background:m.orderQty>0?"#ede9fe":"#f0fdf4", color:m.orderQty>0?"#5b21b6":"#166534" }}>{fmtInt(m.orderQty)}</span>)}
+  </tr>;
+}
+
+const SAMPLE = [
+  { id:1, sku:"SHOE-BLK-10", name:"Black Sneaker Size 10", sold30:90,  sold90:240, sold365:900,  stock:45,  leadTime:14, coverDays:60, daysToBuy:45 },
+  { id:2, sku:"SHOE-WHT-9",  name:"White Runner Size 9",  sold30:60,  sold90:195, sold365:720,  stock:8,   leadTime:14, coverDays:60, daysToBuy:45 },
+  { id:3, sku:"BAG-TOTE-L",  name:"Canvas Tote Large",    sold30:30,  sold90:105, sold365:390,  stock:72,  leadTime:21, coverDays:90, daysToBuy:60 },
+  { id:4, sku:"HAT-CAP-BLU", name:"Blue Baseball Cap",    sold30:120, sold90:330, sold365:1200, stock:15,  leadTime:7,  coverDays:45, daysToBuy:30 },
+  { id:5, sku:"SOCK-WHT-M",  name:"White Crew Socks M",   sold30:200, sold90:570, sold365:2100, stock:300, leadTime:10, coverDays:30, daysToBuy:30 },
+];
+
+function App() {
+  const [skus,      setSkus]      = useState(SAMPLE);
+  const [period,    setPeriod]    = useState(PERIODS[0]);
+  const [defaults,  setDefaults]  = useState({ leadTime:14, coverDays:60, daysToBuy:45 });
+  const [storeName, setStoreName] = useState(null);
+  const [showPanel, setShowPanel] = useState(true);
+  const [sortCol,   setSortCol]   = useState(null);
+  const [sortDir,   setSortDir]   = useState(1);
+  const fileRef = useRef();
+
+  const updateSku = useCallback((id, field, value) => {
+    setSkus(prev => prev.map(s => s.id===id ? {...s,[field]:value} : s));
+  }, []);
+
+  const handleSort = col => {
+    setSortCol(c => { if(c===col){setSortDir(d=>-d);return col;} setSortDir(1);return col; });
+  };
+
+  const displaySkus = useMemo(() => {
+    if (!sortCol) return skus;
+    return [...skus].sort((a,b) => {
+      const ma = calcMetrics(a,period.value,period.key);
+      const mb = calcMetrics(b,period.value,period.key);
+      const va = ma[sortCol]??a[sortCol]??0;
+      const vb = mb[sortCol]??b[sortCol]??0;
+      return (va<vb?-1:va>vb?1:0)*sortDir;
+    });
+  }, [skus,sortCol,sortDir,period]);
+
+  const counts = { healthy:0, watch:0, low:0, critical:0, stockout:0 };
+  skus.forEach(s => { counts[calcMetrics(s,period.value,period.key).status]++; });
+  const totalOrder = skus.reduce((acc,s) => acc+calcMetrics(s,period.value,period.key).orderQty, 0);
+
+  const TH = ({label,col,tip}) => <th title={tip} onClick={()=>col&&handleSort(col)} style={{
+    padding:"10px", textAlign:"right", fontSize:11, fontWeight:700, color:"#6b7280",
+    textTransform:"uppercase", letterSpacing:"0.05em", cursor:col?"pointer":"default",
+    whiteSpace:"nowrap", userSelect:"none", background:sortCol===col?"#eef2ff":"#f9fafb"
+  }}>{label}{col&&sortCol===col?(sortDir===1?" ↑":" ↓"):""}</th>;
+
+  return (
+    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f1f5f9", minHeight:"100vh", padding:"24px 20px" }}>
+      <div style={{ maxWidth:1400, margin:"0 auto" }}>
+
+        {/* Header */}
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12, marginBottom:24 }}>
+          <div>
+            <h1 style={{ fontSize:22, fontWeight:800, color:"#1e1b4b" }}>📦 Inventory Manager</h1>
+            <p style={{ fontSize:13, color:"#6b7280", marginTop:2 }}>Real-time reorder planning · powered by Shopify</p>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:8, background:"#fff", border:"1px solid #e5e7eb", borderRadius:10, padding:"6px 8px" }}>
+            <span style={{ fontSize:12, fontWeight:700, color:"#6b7280", paddingLeft:4 }}>VELOCITY PERIOD:</span>
+            {PERIODS.map(p => <button key={p.value} onClick={()=>setPeriod(p)} style={{
+              padding:"6px 14px", borderRadius:8, border:"none", cursor:"pointer", fontSize:13, fontWeight:600,
+              background:period.value===p.value?"#6366f1":"transparent",
+              color:period.value===p.value?"#fff":"#6b7280"
+            }}>{p.label}</button>)}
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={()=>setShowPanel(s=>!s)} style={{ padding:"7px 14px", borderRadius:8, border:"1px solid #c7d2fe", background:showPanel?"#ede9fe":"#fff", cursor:"pointer", fontSize:13, fontWeight:600, color:"#4c1d95" }}>
+              🛍️ {storeName?"Reconnect":"Connect Shopify"}
+            </button>
+            <input ref={fileRef} type="file" accept=".csv" style={{ display:"none" }} onChange={e=>{
+              const file=e.target.files[0]; if(!file) return;
+              const r=new FileReader();
+              r.onload=ev=>{
+                const lines=ev.target.result.trim().split("\n");
+                const hdrs=lines[0].split(",").map(h=>h.trim().toLowerCase().replace(/\s+/g,"_"));
+                setSkus(lines.slice(1).map((l,i)=>{
+                  const v=l.split(",").map(x=>x.trim()); const o={};
+                  hdrs.forEach((h,j)=>o[h]=v[j]);
+                  return{id:Date.now()+i,sku:o.sku||`SKU-${i+1}`,name:o.name||"",sold30:+o.sold30||0,sold90:+o.sold90||0,sold365:+o.sold365||0,stock:+o.stock||0,...defaults};
+                }));
+              };
+              r.readAsText(file);
+            }} />
+            <button onClick={()=>fileRef.current.click()} style={{ padding:"7px 14px", borderRadius:8, border:"1px solid #d1d5db", background:"#fff", cursor:"pointer", fontSize:13, fontWeight:600, color:"#374151" }}>⬆ Import CSV</button>
+          </div>
+        </div>
+
+        {showPanel && <ShopifyPanel onData={(data,domain)=>{ setSkus(data); setStoreName(domain.replace(/^https?:\/\//,"").replace(".myshopify.com","").replace(/\/$/,"")); setShowPanel(false); }} defaults={defaults} />}
+
+        {/* Global Defaults */}
+        <div style={{ background:"#fff", border:"1px solid #e5e7eb", borderRadius:12, padding:"14px 20px", marginBottom:20 }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
+            <strong style={{ fontSize:14, color:"#374151" }}>🌐 Global Defaults</strong>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:14, alignItems:"center" }}>
+              {[["Lead Time (days)","leadTime"],["Cover Days","coverDays"],["Days to Buy","daysToBuy"]].map(([lbl,key])=>(
+                <label key={key} style={{ display:"flex", alignItems:"center", gap:6, fontSize:13, color:"#6b7280" }}>
+                  {lbl} <EditCell value={defaults[key]} onChange={v=>setDefaults(d=>({...d,[key]:v}))} width={60} />
+                </label>
+              ))}
+              <button onClick={()=>setSkus(prev=>prev.map(s=>({...s,...defaults})))} style={{ padding:"6px 14px", borderRadius:8, border:"none", cursor:"pointer", background:"#6366f1", color:"#fff", fontWeight:700, fontSize:13 }}>Apply to All SKUs</button>
+            </div>
+          </div>
+        </div>
+
+        {/* Summary */}
+        <div style={{ display:"flex", flexWrap:"wrap", gap:10, marginBottom:20, alignItems:"center" }}>
+          {storeName && <div style={{ background:"#ede9fe", color:"#4c1d95", borderRadius:10, padding:"8px 14px", fontSize:13, fontWeight:700 }}>🛍️ {storeName}</div>}
+          {Object.entries(counts).map(([k,v])=>(
+            <div key={k} style={{ background:STATUS[k].bg, color:STATUS[k].color, border:`1px solid ${STATUS[k].dot}33`, borderRadius:10, padding:"8px 16px", fontSize:13, fontWeight:600 }}>
+              {STATUS[k].label}: <strong>{v}</strong>
+            </div>
+          ))}
+          <div style={{ background:"#ede9fe", color:"#4c1d95", border:"1px solid #c4b5fd", borderRadius:10, padding:"8px 16px", fontSize:13, fontWeight:600, marginLeft:"auto" }}>
+            Total to Order: <strong>{fmtInt(totalOrder)}</strong>
+          </div>
+        </div>
+
+        {/* Table */}
+        <div style={{ background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"auto", boxShadow:"0 1px 4px rgba(0,0,0,.06)" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", minWidth:1100 }}>
+            <thead>
+              <tr style={{ borderBottom:"2px solid #e5e7eb" }}>
+                <TH label="SKU / Product" />
+                <TH label="Status"         col="status" />
+                <TH label="Daily Sales"    col="dailySales" />
+                <TH label="Stock on Hand"  col="stock" />
+                <TH label="Days Cover"     col="daysOfCover" />
+                <TH label="Lead Time Use"  col="leadTimeUse" />
+                <TH label="Avail After LT" col="availAfterLT" />
+                <TH label="Reorder Point"  col="reorderPoint" />
+                <TH label="Lead Time (d)" />
+                <TH label="Cover Days" />
+                <TH label="Days to Buy" />
+                <TH label="Order Qty"      col="orderQty" />
+              </tr>
+            </thead>
+            <tbody>
+              {displaySkus.map(s=>(
+                <SKURow key={s.id} sku={s} periodDays={period.value} periodKey={period.key}
+                  onUpdate={(field,val)=>updateSku(s.id,field,val)} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div style={{ marginTop:16, display:"flex", flexWrap:"wrap", gap:10, alignItems:"center" }}>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:600 }}>LEGEND:</span>
+          {Object.entries(STATUS).map(([k,s])=>(
+            <span key={k} style={{ display:"inline-flex", alignItems:"center", gap:5, fontSize:11, color:s.color, background:s.bg, borderRadius:6, padding:"2px 8px" }}>
+              <span style={{ width:6, height:6, borderRadius:"50%", background:s.dot, display:"inline-block" }} />{s.label}
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
