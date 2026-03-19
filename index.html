@@ -112,21 +112,21 @@ async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings,
     if (variant) variant.stock = Math.max(0, (variant.stock || 0) + (l.available || 0));
   });
 
-  // Fetch orders in weekly chunks to stay under 250 per chunk
-  // With ~950 orders/month = ~220/week, weekly chunks should fit in one request
+  // Fetch orders in daily chunks to ensure we never hit the 250/request limit
+  // ~950 orders/month = ~32/day, well under 250
   const now = Date.now();
   const since365ms = now - 365 * 86400000;
   const since90ms  = now - 90  * 86400000;
   const since30ms  = now - 30  * 86400000;
 
   let allOrders = [];
-  const chunkDays = 7; // weekly chunks ~220 orders each
-  const totalChunks = Math.ceil(365 / chunkDays); // ~52 weeks
+  const chunkDays = 1;
+  const totalChunks = 365;
 
   for (let i = 0; i < totalChunks; i++) {
-    const chunkEnd   = new Date(now - i * chunkDays * 86400000).toISOString();
-    const chunkStart = new Date(now - (i + 1) * chunkDays * 86400000).toISOString();
-    onProgress(`Fetching orders… (week ${i + 1} of ${totalChunks}, ${allOrders.length} orders so far)`);
+    const chunkEnd   = new Date(now - i * 86400000).toISOString();
+    const chunkStart = new Date(now - (i + 1) * 86400000).toISOString();
+    if (i % 7 === 0) onProgress(`Fetching orders… (day ${i + 1} of ${totalChunks}, ${allOrders.length} orders so far)`);
     const ordData = await apiFetch(
       `/orders.json?status=any&created_at_min=${chunkStart}&created_at_max=${chunkEnd}&fields=created_at,line_items&limit=250`
     );
