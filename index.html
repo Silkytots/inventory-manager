@@ -112,21 +112,21 @@ async function fetchShopifyData(domain, clientId, clientSecret, defaultSettings,
     if (variant) variant.stock = Math.max(0, (variant.stock || 0) + (l.available || 0));
   });
 
-  // Fetch orders in daily chunks to ensure we never hit the 250/request limit
-  // ~950 orders/month = ~32/day, well under 250
+  // 3-day chunks = ~96 orders per chunk, well under 250 limit
+  // 122 total requests vs 365 for daily — loads in ~60-90 seconds
   const now = Date.now();
   const since365ms = now - 365 * 86400000;
   const since90ms  = now - 90  * 86400000;
   const since30ms  = now - 30  * 86400000;
 
   let allOrders = [];
-  const chunkDays = 1;
-  const totalChunks = 365;
+  const chunkDays = 3;
+  const totalChunks = Math.ceil(365 / chunkDays); // 122 chunks
 
   for (let i = 0; i < totalChunks; i++) {
-    const chunkEnd   = new Date(now - i * 86400000).toISOString();
-    const chunkStart = new Date(now - (i + 1) * 86400000).toISOString();
-    if (i % 7 === 0) onProgress(`Fetching orders… (day ${i + 1} of ${totalChunks}, ${allOrders.length} orders so far)`);
+    const chunkEnd   = new Date(now - i * chunkDays * 86400000).toISOString();
+    const chunkStart = new Date(now - (i + 1) * chunkDays * 86400000).toISOString();
+    if (i % 10 === 0) onProgress(`Fetching orders… (${Math.round(i/totalChunks*100)}% complete, ${allOrders.length} orders so far)`);
     const ordData = await apiFetch(
       `/orders.json?status=any&created_at_min=${chunkStart}&created_at_max=${chunkEnd}&fields=created_at,line_items&limit=250`
     );
@@ -236,22 +236,33 @@ function AutocompleteSearch({ skus, value, onChange }) {
 }
 
 // ─── UI COMPONENTS ────────────────────────────────────────────────────────────
-function ShopifyPanel({ onData, defaults }) {
-  const [domain,   setDomain]   = useState("silky-tots-us.myshopify.com");
-  const [clientId, setClientId] = useState("");
-  const [secret,   setSecret]   = useState("");
+function ShopifyPanel({ onData, defaults, onHide }) {
+  const [domain,   setDomain]   = useState(() => localStorage.getItem("inv_domain")   || "silky-tots-us.myshopify.com");
+  const [clientId, setClientId] = useState(() => localStorage.getItem("inv_clientid") || "");
+  const [secret,   setSecret]   = useState(() => localStorage.getItem("inv_secret")   || "");
   const [loading,  setLoading]  = useState(false);
   const [progress, setProgress] = useState("");
   const [error,    setError]    = useState("");
 
   const connect = async () => {
     if (!domain || !clientId || !secret) { setError("All fields required."); return; }
+    // Save credentials to localStorage so user doesn't have to re-enter
+    localStorage.setItem("inv_domain",   domain);
+    localStorage.setItem("inv_clientid", clientId);
+    localStorage.setItem("inv_secret",   secret);
     setLoading(true); setError(""); setProgress("");
     try {
       const skus = await fetchShopifyData(domain, clientId, secret, defaults, setProgress);
       onData(skus, domain);
     } catch(e) { setError(`Connection failed: ${e.message}`); }
     finally { setLoading(false); setProgress(""); }
+  };
+
+  const forget = () => {
+    localStorage.removeItem("inv_domain");
+    localStorage.removeItem("inv_clientid");
+    localStorage.removeItem("inv_secret");
+    setDomain(""); setClientId(""); setSecret("");
   };
 
   return (
